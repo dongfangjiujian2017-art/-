@@ -66,23 +66,26 @@ def smart_replace(doc, replace_dict):
     return doc
 
 def parse_replace_text(text):
-    """解析 '旧内容 ==>> 新内容' 格式"""
+    """解析 '旧内容 ==>> 新内容' 格式，同时清理可能存在的 Markdown 符号"""
     replace_dict = {}
     for line in text.split('\n'):
-        if "==>>" in line:
-            parts = line.split("==>>")
+        # 清理行首尾的 Markdown 粗体符号 **
+        clean_line = line.replace('**', '').replace('`', '').strip()
+        if "==>>" in clean_line:
+            parts = clean_line.split("==>>")
             if len(parts) == 2:
                 replace_dict[parts[0].strip()] = parts[1].strip()
     return replace_dict
 
 # --- AI Logic: Calling DeepSeek API with Retry Mechanism ---
 def get_deepseek_rules(api_key, base_url, doc_content, user_demand):
-    """调用 DeepSeek API 生成规则，包含重试机制以应对超时"""
+    """调用 DeepSeek API 生成规则，优化提示词以去除 Markdown 格式"""
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {api_key}"
     }
     
+    # 强化了对格式的约束要求
     prompt = f"""
     你是一个文档处理专家。下面是一段 Word 模板的内容：
     ---
@@ -91,26 +94,30 @@ def get_deepseek_rules(api_key, base_url, doc_content, user_demand):
     用户的修改需求是："{user_demand}"
     
     请对比模板内容，找出需要被替换的精确原文字，并生成替换列表。
-    要求：
+    
+    【重要指令 - 格式要求】：
     1. 严格遵守格式：旧内容 ==>> 新内容
-    2. 每行一对，不要有任何多余的文字、序号或解释。
-    3. 确保“旧内容”在模板文本中是完全一致的字符串。
+    2. 禁止使用任何 Markdown 格式。不要加粗（不要使用 **），不要使用代码块，不要使用序号。
+    3. 每行只有一对替换规则，不要有任何多余的文字、标点或解释。
+    4. 确保“旧内容”是模板文本中真实存在的、未加任何修饰的纯字符串。
+    
+    正确示例：
+    【甲方名称】 ==>> 华为技术有限公司
+    2024年1月1日 ==>> 2026年4月19日
     """
     
     data = {
         "model": "deepseek-chat",
         "messages": [
-            {"role": "system", "content": "你是一个专业的文档分析助手。"},
+            {"role": "system", "content": "你是一个专业的文档分析助手，只输出纯文本格式的替换规则。"},
             {"role": "user", "content": prompt}
         ],
         "stream": False
     }
 
-    # 重试逻辑：最多尝试 5 次，延迟分别为 1s, 2s, 4s, 8s, 16s
     max_retries = 5
     for attempt in range(max_retries):
         try:
-            # 增加 timeout 到 60 秒
             response = requests.post(
                 f"{base_url}/chat/completions", 
                 headers=headers, 
@@ -144,7 +151,7 @@ def main():
             st.success("已在此会话中记住设置")
             
         st.divider()
-        st.caption("提示：由于 DeepSeek 访问量大，若出现超时，程序会自动重试。")
+        st.caption("提示：已优化 AI 提示词，自动过滤 ** 加粗等 Markdown 格式。")
 
     col1, col2 = st.columns([1, 1])
 
@@ -170,12 +177,12 @@ def main():
             elif not uploaded_file or not user_demand:
                 st.warning("请上传文件并输入修改需求")
             else:
-                with st.spinner("DeepSeek 正在思考中（若超时会自动重试）..."):
+                with st.spinner("DeepSeek 正在生成纯文本规则..."):
                     result = get_deepseek_rules(input_key, input_url, doc_sample, user_demand)
                     st.session_state.ai_rules = result
 
     with col2:
-        st.subheader("3. 确认与下载")
+        st.subheader("3. 确认与执行")
         rules_text = st.text_area(
             "最终替换规则 (旧内容 ==>> 新内容)",
             value=st.session_state.ai_rules,
@@ -186,6 +193,7 @@ def main():
             if not uploaded_file or not rules_text:
                 st.error("请补充完整信息")
             else:
+                # 解析时会二次清理 Markdown 符号
                 replacements = parse_replace_text(rules_text)
                 with st.spinner("保留格式替换中..."):
                     doc = Document(uploaded_file)
@@ -198,7 +206,7 @@ def main():
                     st.download_button(
                         "📥 下载处理后的 Word",
                         data=output,
-                        file_name=f"Smart_Fixed_{uploaded_file.name}",
+                        file_name=f"Clean_Fixed_{uploaded_file.name}",
                         mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                         use_container_width=True
                     )
