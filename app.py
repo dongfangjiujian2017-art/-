@@ -3,6 +3,7 @@ import io
 import streamlit as st
 import requests
 import json
+import time
 
 # Try to import necessary libraries
 try:
@@ -19,16 +20,13 @@ CONFIG_FILE = "config.json"
 
 def load_config():
     """优先级读取 API Key：1. Session 2. 环境变量 3. 本地文件"""
-    # 优先从 Streamlit Session State 获取（防止页面刷新丢失）
     if "saved_api_key" in st.session_state:
         return {"api_key": st.session_state.saved_api_key, "base_url": st.session_state.get("saved_base_url", "https://api.deepseek.com")}
 
-    # 1. 尝试环境变量 (Streamlit Cloud Secrets)
     env_key = os.environ.get("DEEPSEEK_API_KEY", "")
     if env_key:
         return {"api_key": env_key, "base_url": "https://api.deepseek.com"}
     
-    # 2. 尝试本地配置文件
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, "r") as f:
@@ -45,7 +43,7 @@ def save_config(api_key, base_url):
         with open(CONFIG_FILE, "w") as f:
             json.dump({"api_key": api_key, "base_url": base_url}, f)
     except:
-        pass # 在云端环境可能无法写入文件，忽略即可
+        pass 
 
 # --- Core Logic: Word Replacement ---
 def _apply_replace(paragraph, replace_dict):
@@ -77,53 +75,65 @@ def parse_replace_text(text):
                 replace_dict[parts[0].strip()] = parts[1].strip()
     return replace_dict
 
-# --- AI Logic: Calling DeepSeek API ---
+# --- AI Logic: Calling DeepSeek API with Retry Mechanism ---
 def get_deepseek_rules(api_key, base_url, doc_content, user_demand):
-    """调用 DeepSeek API 生成规则"""
-    try:
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}"
-        }
-        
-        prompt = f"""
-        你是一个文档处理专家。下面是一段 Word 模板的内容：
-        ---
-        {doc_content}
-        ---
-        用户的修改需求是："{user_demand}"
-        
-        请对比模板内容，找出需要被替换的精确原文字，并生成替换列表。
-        要求：
-        1. 严格遵守格式：旧内容 ==>> 新内容
-        2. 每行一对，不要有任何多余的文字、序号或解释。
-        3. 确保“旧内容”在模板文本中是完全一致的字符串。
-        """
-        
-        data = {
-            "model": "deepseek-chat",
-            "messages": [
-                {"role": "system", "content": "你是一个专业的文档分析助手。"},
-                {"role": "user", "content": prompt}
-            ],
-            "stream": False
-        }
-        
-        response = requests.post(f"{base_url}/chat/completions", headers=headers, json=data, timeout=30)
-        response.raise_for_status()
-        result = response.json()
-        return result['choices'][0]['message']['content']
-    except Exception as e:
-        return f"Error: {str(e)}"
+    """调用 DeepSeek API 生成规则，包含重试机制以应对超时"""
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}"
+    }
+    
+    prompt = f"""
+    你是一个文档处理专家。下面是一段 Word 模板的内容：
+    ---
+    {doc_content}
+    ---
+    用户的修改需求是："{user_demand}"
+    
+    请对比模板内容，找出需要被替换的精确原文字，并生成替换列表。
+    要求：
+    1. 严格遵守格式：旧内容 ==>> 新内容
+    2. 每行一对，不要有任何多余的文字、序号或解释。
+    3. 确保“旧内容”在模板文本中是完全一致的字符串。
+    """
+    
+    data = {
+        "model": "deepseek-chat",
+        "messages": [
+            {"role": "system", "content": "你是一个专业的文档分析助手。"},
+            {"role": "user", "content": prompt}
+        ],
+        "stream": False
+    }
+
+    # 重试逻辑：最多尝试 5 次，延迟分别为 1s, 2s, 4s, 8s, 16s
+    max_retries = 5
+    for attempt in range(max_retries):
+        try:
+            # 增加 timeout 到 60 秒
+            response = requests.post(
+                f"{base_url}/chat/completions", 
+                headers=headers, 
+                json=data, 
+                timeout=60 
+            )
+            response.raise_for_status()
+            result = response.json()
+            return result['choices'][0]['message']['content']
+        except (requests.exceptions.RequestException, requests.exceptions.Timeout) as e:
+            if attempt < max_retries - 1:
+                wait_time = 2 ** attempt
+                time.sleep(wait_time)
+                continue
+            else:
+                return f"❌ API 连线失败（已重试 {max_retries} 次）: {str(e)}"
 
 # --- UI Interface ---
 def main():
     st.title("🐼 DeepSeek x Word 智能助手")
     
-    # 初始化配置
     config = load_config()
     
-    # 侧边栏设置
     with st.sidebar:
         st.header("⚙️ API 配置")
         input_key = st.text_input("DeepSeek API Key", value=config["api_key"], type="password")
@@ -134,7 +144,7 @@ def main():
             st.success("已在此会话中记住设置")
             
         st.divider()
-        st.caption("注：若在 Streamlit Cloud 无法找到 Secrets 选项，请尝试在 [share.streamlit.io](https://share.streamlit.io) 列表页点击 Settings。")
+        st.caption("提示：由于 DeepSeek 访问量大，若出现超时，程序会自动重试。")
 
     col1, col2 = st.columns([1, 1])
 
@@ -160,7 +170,7 @@ def main():
             elif not uploaded_file or not user_demand:
                 st.warning("请上传文件并输入修改需求")
             else:
-                with st.spinner("DeepSeek 正在分析并提取键值对..."):
+                with st.spinner("DeepSeek 正在思考中（若超时会自动重试）..."):
                     result = get_deepseek_rules(input_key, input_url, doc_sample, user_demand)
                     st.session_state.ai_rules = result
 
