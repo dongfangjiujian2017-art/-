@@ -5,17 +5,17 @@ import requests
 import json
 import time
 
-# Try to import necessary libraries
+# 尝试导入必要库
 try:
     from docx import Document
 except ImportError:
     st.error("❌ 缺少依赖库：python-docx。请运行 `pip install python-docx`。")
     st.stop()
 
-# --- Page Configuration ---
+# --- 页面配置 ---
 st.set_page_config(page_title="DeepSeek x Word 智能助手", page_icon="🐼", layout="wide")
 
-# --- Persistent Configuration Management ---
+# --- 持久化配置管理 ---
 CONFIG_FILE = "config.json"
 
 def load_config():
@@ -45,7 +45,7 @@ def save_config(api_key, base_url):
     except:
         pass 
 
-# --- Core Logic: Word Replacement ---
+# --- 核心逻辑：Word 替换 ---
 def _apply_replace(paragraph, replace_dict):
     """替换段落文本并保留格式"""
     for old_text, new_text in replace_dict.items():
@@ -55,9 +55,16 @@ def _apply_replace(paragraph, replace_dict):
                     run.text = run.text.replace(old_text, new_text)
 
 def smart_replace(doc, replace_dict):
-    """扫描全文和表格"""
+    """
+    全面扫描替换。
+    说明：此函数仅处理正文段落和表格中的内容。
+    由于不涉及 doc.sections[0].header/footer 的操作，原文档自带的页眉页脚将原封不动地保留。
+    """
+    # 1. 替换正文
     for p in doc.paragraphs:
         _apply_replace(p, replace_dict)
+    
+    # 2. 替换表格
     for table in doc.tables:
         for row in table.rows:
             for cell in row.cells:
@@ -66,10 +73,10 @@ def smart_replace(doc, replace_dict):
     return doc
 
 def parse_replace_text(text):
-    """解析 '旧内容 ==>> 新内容' 格式，同时清理可能存在的 Markdown 符号"""
+    """解析 '旧内容 ==>> 新内容' 格式，清理 Markdown"""
     replace_dict = {}
     for line in text.split('\n'):
-        # 清理行首尾的 Markdown 粗体符号 **
+        # 移除可能干扰匹配的 Markdown 符号
         clean_line = line.replace('**', '').replace('`', '').strip()
         if "==>>" in clean_line:
             parts = clean_line.split("==>>")
@@ -77,15 +84,14 @@ def parse_replace_text(text):
                 replace_dict[parts[0].strip()] = parts[1].strip()
     return replace_dict
 
-# --- AI Logic: Calling DeepSeek API with Retry Mechanism ---
+# --- AI 逻辑：调用 DeepSeek API ---
 def get_deepseek_rules(api_key, base_url, doc_content, user_demand):
-    """调用 DeepSeek API 生成规则，优化提示词以去除 Markdown 格式"""
+    """调用 DeepSeek API 生成规则"""
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {api_key}"
     }
     
-    # 强化了对格式的约束要求
     prompt = f"""
     你是一个文档处理专家。下面是一段 Word 模板的内容：
     ---
@@ -94,16 +100,10 @@ def get_deepseek_rules(api_key, base_url, doc_content, user_demand):
     用户的修改需求是："{user_demand}"
     
     请对比模板内容，找出需要被替换的精确原文字，并生成替换列表。
-    
-    【重要指令 - 格式要求】：
-    1. 严格遵守格式：旧内容 ==>> 新内容
-    2. 禁止使用任何 Markdown 格式。不要加粗（不要使用 **），不要使用代码块，不要使用序号。
-    3. 每行只有一对替换规则，不要有任何多余的文字、标点或解释。
-    4. 确保“旧内容”是模板文本中真实存在的、未加任何修饰的纯字符串。
-    
-    正确示例：
-    【甲方名称】 ==>> 华为技术有限公司
-    2024年1月1日 ==>> 2026年4月19日
+    格式要求：
+    1. 严格使用：旧内容 ==>> 新内容
+    2. 禁止 Markdown 格式（不要加粗 **，不要代码块）。
+    3. 确保“旧内容”在模板中真实存在。
     """
     
     data = {
@@ -115,43 +115,34 @@ def get_deepseek_rules(api_key, base_url, doc_content, user_demand):
         "stream": False
     }
 
-    max_retries = 5
+    max_retries = 3
     for attempt in range(max_retries):
         try:
-            response = requests.post(
-                f"{base_url}/chat/completions", 
-                headers=headers, 
-                json=data, 
-                timeout=60 
-            )
+            response = requests.post(f"{base_url}/chat/completions", headers=headers, json=data, timeout=60)
             response.raise_for_status()
-            result = response.json()
-            return result['choices'][0]['message']['content']
-        except (requests.exceptions.RequestException, requests.exceptions.Timeout) as e:
+            return response.json()['choices'][0]['message']['content']
+        except:
             if attempt < max_retries - 1:
-                wait_time = 2 ** attempt
-                time.sleep(wait_time)
+                time.sleep(2)
                 continue
-            else:
-                return f"❌ API 连线失败（已重试 {max_retries} 次）: {str(e)}"
+            return "❌ API 连接超时，请稍后再试。"
 
-# --- UI Interface ---
+# --- UI 界面 ---
 def main():
     st.title("🐼 DeepSeek x Word 智能助手")
     
     config = load_config()
     
     with st.sidebar:
-        st.header("⚙️ API 配置")
+        st.header("⚙️ 设置")
         input_key = st.text_input("DeepSeek API Key", value=config["api_key"], type="password")
         input_url = st.text_input("Base URL", value=config["base_url"])
-        
         if st.button("💾 临时记住 Key"):
             save_config(input_key, input_url)
-            st.success("已在此会话中记住设置")
-            
+            st.success("已记住设置")
+        
         st.divider()
-        st.caption("提示：已优化 AI 提示词，自动过滤 ** 加粗等 Markdown 格式。")
+        st.info("提示：此版本会原样保留您 Word 文档中原有的页眉和页脚。")
 
     col1, col2 = st.columns([1, 1])
 
@@ -162,11 +153,12 @@ def main():
         doc_sample = ""
         if uploaded_file:
             doc = Document(uploaded_file)
+            # 获取前 3000 字作为 AI 参考
             doc_sample = "\n".join([p.text for p in doc.paragraphs])[:3000]
             st.success(f"✅ 已加载: {uploaded_file.name}")
 
         st.subheader("2. 描述需求")
-        user_demand = st.text_area("告诉 AI 你想改什么？", placeholder="例如：把甲方换成华为，日期设为2026年4月")
+        user_demand = st.text_area("告诉 AI 你想改什么？", placeholder="例如：把甲方换成华为...")
         
         if "ai_rules" not in st.session_state:
             st.session_state.ai_rules = ""
@@ -174,29 +166,26 @@ def main():
         if st.button("✨ 生成替换规则", type="primary"):
             if not input_key:
                 st.error("请先输入 API Key")
-            elif not uploaded_file or not user_demand:
-                st.warning("请上传文件并输入修改需求")
+            elif not uploaded_file:
+                st.warning("请上传文件")
             else:
-                with st.spinner("DeepSeek 正在生成纯文本规则..."):
+                with st.spinner("DeepSeek 分析中..."):
                     result = get_deepseek_rules(input_key, input_url, doc_sample, user_demand)
                     st.session_state.ai_rules = result
 
     with col2:
-        st.subheader("3. 确认与执行")
-        rules_text = st.text_area(
-            "最终替换规则 (旧内容 ==>> 新内容)",
-            value=st.session_state.ai_rules,
-            height=300
-        )
+        st.subheader("3. 执行替换")
+        rules_text = st.text_area("最终替换规则", value=st.session_state.ai_rules, height=300)
         
         if st.button("🚀 执行替换并下载", use_container_width=True):
-            if not uploaded_file or not rules_text:
-                st.error("请补充完整信息")
+            if not uploaded_file:
+                st.error("请上传模板")
             else:
-                # 解析时会二次清理 Markdown 符号
                 replacements = parse_replace_text(rules_text)
-                with st.spinner("保留格式替换中..."):
+                with st.spinner("正在处理正文和表格..."):
+                    # 重新打开文档进行处理
                     doc = Document(uploaded_file)
+                    # 执行替换逻辑（不触碰页眉页脚）
                     processed_doc = smart_replace(doc, replacements)
                     
                     output = io.BytesIO()
@@ -206,7 +195,7 @@ def main():
                     st.download_button(
                         "📥 下载处理后的 Word",
                         data=output,
-                        file_name=f"Clean_Fixed_{uploaded_file.name}",
+                        file_name=f"Fixed_{uploaded_file.name}",
                         mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                         use_container_width=True
                     )
