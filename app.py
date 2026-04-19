@@ -33,11 +33,11 @@ def clone_only_body_content(source_doc, target_doc):
 
 def safe_replace_text(doc, replace_dict):
     """
-    全量文本替换：涵盖正文、表格以及页眉(通常标题所在处)
+    全量深度替换：涵盖所有段落、表格、页眉以及隐藏的节属性
     """
     if not replace_dict: return
 
-    # 1. 替换所有页眉内容 (很多文档的标题在页眉)
+    # 1. 替换所有节的页眉（通常标题就在这里）
     for section in doc.sections:
         header = section.header
         for p in header.paragraphs:
@@ -45,18 +45,19 @@ def safe_replace_text(doc, replace_dict):
         for table in header.tables:
             _replace_in_table(table, replace_dict)
 
-    # 2. 替换正文段落
+    # 2. 替换文档主体的段落
     for p in doc.paragraphs:
         _replace_in_paragraph(p, replace_dict)
 
-    # 3. 替换表格内容
+    # 3. 替换文档主体的表格内容
     for table in doc.tables:
         _replace_in_table(table, replace_dict)
 
 def _replace_in_paragraph(p, replace_dict):
-    """底层段落替换逻辑"""
+    """底层段落替换逻辑，确保保留样式"""
     for old, new in replace_dict.items():
         if old in p.text:
+            # 必须遍历 Runs 替换才能保留加粗、字号等格式
             for run in p.runs:
                 if old in run.text:
                     run.text = run.text.replace(old, new)
@@ -71,8 +72,7 @@ def _replace_in_table(table, replace_dict):
 def get_deepseek_rules(api_key, base_url, doc_sample, user_demand):
     """请求 AI 生成规则"""
     headers = {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
-    # 强化 Prompt，要求 AI 必须覆盖标题
-    prompt = f"正文样本：{doc_sample}\n修改需求：{user_demand}\n请输出替换对。格式：旧内容 ==>> 新内容。注意：必须包含标题中的关键信息替换。只输出对子，严禁其他文字。"
+    prompt = f"正文样本：{doc_sample}\n修改需求：{user_demand}\n请输出替换对。格式：旧内容 ==>> 新内容。注意：必须包含标题和正文中的所有关键信息替换。只输出对子，严禁其他文字。"
     data = {
         "model": "deepseek-chat",
         "messages": [{"role": "user", "content": prompt}],
@@ -90,6 +90,7 @@ def get_deepseek_rules(api_key, base_url, doc_sample, user_demand):
 def parse_rules(rules_text):
     """解析键值对"""
     replace_dict = {}
+    if not rules_text: return replace_dict
     for line in rules_text.split('\n'):
         if "==>>" in line:
             parts = line.split("==>>")
@@ -105,12 +106,11 @@ def main():
         api_key = st.text_input("DeepSeek API Key", value=def_key, type="password")
         base_url = st.text_input("Base URL", value=def_url)
 
-    # 简化的使用说明
     st.markdown("""
     ### 📖 使用说明
     1. **上传模板**：上传您的 Word 文档。
     2. **输入需求**：描述您想修改的内容（如：把甲方改为华为）。
-    3. **自动生成**：系统将自动替换正文及标题内容，并保留原始页脚。
+    3. **自动生成**：系统将自动替换标题、正文及表格内容，并保留原始页脚。
     """)
 
     uploaded_file = st.file_uploader("1. 上传模板文件", type=["docx"])
@@ -123,41 +123,46 @@ def main():
 
         with st.spinner("正在处理文档..."):
             content_bytes = uploaded_file.getvalue()
-            source_doc = Document(io.BytesIO(content_bytes))
             
-            # 自动处理：如果用户粘贴了规则则直接解析，否则请求AI
+            # 初始化两个文档实例
+            # source_doc 用于被 AI 分析和文字修改
+            source_doc = Document(io.BytesIO(content_bytes))
+            # container_doc 作为最终容器（保留原始页脚/节属性）
+            container_doc = Document(io.BytesIO(content_bytes))
+            
+            # 获取替换规则
             if "==>>" in user_input:
                 replacements = parse_rules(user_input)
             else:
                 if not api_key:
-                    st.error("请在上方设置中输入 API Key 以启用智能分析")
+                    st.error("请在上方设置中输入 API Key")
                     return
-                # 样本提取（包含前20段以确保抓到标题）
+                # 样本提取（包含标题部分）
                 sample_text = "\n".join([p.text for p in source_doc.paragraphs[:20]])
                 ai_raw = get_deepseek_rules(api_key, base_url, sample_text, user_input)
                 replacements = parse_rules(ai_raw)
             
             if not replacements:
-                st.error("未能识别修改指令，请尝试更明确地描述。")
+                st.error("未能识别修改指令。")
                 return
 
-            # 创建下载容器并执行替换逻辑
-            container_doc = Document(io.BytesIO(content_bytes))
-            
-            # 在源文档上执行替换（包含页眉标题）
+            # --- 核心替换流程 ---
+            # 第一步：修改源文档内容
             safe_replace_text(source_doc, replacements)
             
-            # 将改好的内容克隆进保留了页脚定义的容器
+            # 第二步：将源文档改好的正文（段落和表格）克隆到容器中
+            # 注意：此步不触碰容器原有的页眉页脚（sectPr）
             clone_only_body_content(source_doc, container_doc)
 
-            # 针对容器文档也要单独跑一次页眉替换，因为页眉定义在容器的 sectPr 里
+            # 第三步：【关键修复】对容器文档本身再次执行替换
+            # 因为页眉标题存在于容器的节属性中，必须对容器也跑一遍替换逻辑
             safe_replace_text(container_doc, replacements)
 
             output = io.BytesIO()
             container_doc.save(output)
             output.seek(0)
             
-            st.success(f"✅ 处理成功！已识别并替换 {len(replacements)} 处关键信息。")
+            st.success(f"✅ 处理成功！已同步替换标题和正文中的 {len(replacements)} 类信息。")
             st.download_button(
                 "📥 点击下载新文档", 
                 data=output, 
