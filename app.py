@@ -35,23 +35,20 @@ def save_config(api_key, base_url):
 def safe_replace_in_paragraph(paragraph, replace_dict):
     """
     安全地在段落中替换文本。
-    通过检查 run 的底层 XML，避开包含域代码（如页码）的节点。
+    采用“段落级物理隔离”：只要段落包含域代码，整段放弃处理，防止 WPS 解析崩溃。
     """
+    # --- 终极防御：段落级隔离 ---
+    xml_str = paragraph._element.xml
+    # 'w:fldChar' 和 'w:instrText' 是动态域（如页码）的独有标记
+    if 'w:fldChar' in xml_str or 'w:instrText' in xml_str:
+        return # 立即退出，该段落原封不动保留
+        
     for old_text, new_text in replace_dict.items():
         if not old_text or old_text not in paragraph.text:
             continue
             
         for run in paragraph.runs:
-            # 关键：检查这个 run 是否包含域代码相关的标记
-            # 如果 run 包含 w:fldChar 等标记，python-docx 通常会将其分开
-            # 我们只处理纯文本的 run.text
             if old_text in run.text:
-                # 检查底层 XML 确保不是域代码的一部分
-                xml_str = run._element.xml
-                if 'w:fldChar' in xml_str or 'w:instrText' in xml_str:
-                    # 这是一个域代码节点（如 PAGE），绝对不能碰
-                    continue
-                
                 run.text = run.text.replace(old_text, new_text)
 
 def process_all_parts(doc, replace_dict):
