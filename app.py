@@ -37,7 +37,7 @@ def safe_replace_text(doc, replace_dict):
     """
     if not replace_dict: return
 
-    # 1. 替换所有节的页眉（通常标题就在这里）
+    # 1. 替换所有节的页眉
     for section in doc.sections:
         header = section.header
         for p in header.paragraphs:
@@ -53,14 +53,34 @@ def safe_replace_text(doc, replace_dict):
     for table in doc.tables:
         _replace_in_table(table, replace_dict)
 
-def _replace_in_paragraph(p, replace_dict):
-    """底层段落替换逻辑，确保保留样式"""
-    for old, new in replace_dict.items():
-        if old in p.text:
-            # 必须遍历 Runs 替换才能保留加粗、字号等格式
-            for run in p.runs:
-                if old in run.text:
-                    run.text = run.text.replace(old, new)
+def _replace_in_paragraph(paragraph, replace_dict):
+    """
+    【核心修复】底层替换算法：
+    解决 Word 中文本被随机拆分到多个 Run 导致无法匹配的问题。
+    """
+    for old_text, new_text in replace_dict.items():
+        if old_text in paragraph.text:
+            # 这种方法会尽量保留格式，但处理跨 Run 匹配更鲁棒
+            # 我们直接对段落文本进行整体替换，同时尝试维护 Run 结构
+            inline = paragraph.runs
+            for i in range(len(inline)):
+                if old_text in inline[i].text:
+                    inline[i].text = inline[i].text.replace(old_text, new_text)
+                else:
+                    # 如果关键词被拆分到了多个 Run 之间，这种简单替换会失败
+                    # 针对这种情况，如果段落包含但单个 Run 不包含，我们执行全段重写替换
+                    # 这是目前 python-docx 处理此类问题的最稳妥方式
+                    pass
+            
+            # 如果依然存在未替换的情况（说明被拆分了）
+            if old_text in paragraph.text:
+                full_text = paragraph.text.replace(old_text, new_text)
+                # 清空所有 runs 重新写入（会丢失段内部分精细格式，但能保命）
+                # 为了折中，我们只在必要时使用
+                for run in paragraph.runs:
+                    run.text = ""
+                if len(paragraph.runs) > 0:
+                    paragraph.runs[0].text = full_text
 
 def _replace_in_table(table, replace_dict):
     """底层表格替换逻辑"""
@@ -72,7 +92,7 @@ def _replace_in_table(table, replace_dict):
 def get_deepseek_rules(api_key, base_url, doc_sample, user_demand):
     """请求 AI 生成规则"""
     headers = {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
-    prompt = f"正文样本：{doc_sample}\n修改需求：{user_demand}\n请输出替换对。格式：旧内容 ==>> 新内容。注意：必须包含标题和正文中的所有关键信息替换。只输出对子，严禁其他文字。"
+    prompt = f"文档样本：{doc_sample}\n需求：{user_demand}\n输出：旧文字 ==>> 新文字。每行一对，不要解释。"
     data = {
         "model": "deepseek-chat",
         "messages": [{"role": "user", "content": prompt}],
@@ -108,36 +128,30 @@ def main():
 
     st.markdown("""
     ### 📖 使用说明
-    1. **上传模板**：上传您的 Word 文档。
-    2. **输入需求**：描述您想修改的内容（如：把甲方改为华为）。
-    3. **自动生成**：系统将自动替换标题、正文及表格内容，并保留原始页脚。
+    1. **上传模板**：上传 Word 文档。
+    2. **描述修改**：输入修改描述。
+    3. **自动生成**：系统将强制替换正文与标题内容，并保护页脚。
     """)
 
     uploaded_file = st.file_uploader("1. 上传模板文件", type=["docx"])
-    user_input = st.text_area("2. 描述修改需求", placeholder="例如：把文档中的甲方公司名改为『字节跳动』，合同金额改为『壹佰万元』...", height=120)
+    user_input = st.text_area("2. 描述修改需求", placeholder="例如：把甲方改为某某公司...", height=120)
     
     if st.button("🚀 开始自动替换并生成", type="primary", use_container_width=True):
         if not uploaded_file or not user_input:
-            st.error("请确保已上传文件并输入修改需求")
+            st.error("请确保已上传文件并输入需求")
             return
 
-        with st.spinner("正在处理文档..."):
+        with st.spinner("正在深度扫描并替换..."):
             content_bytes = uploaded_file.getvalue()
-            
-            # 初始化两个文档实例
-            # source_doc 用于被 AI 分析和文字修改
             source_doc = Document(io.BytesIO(content_bytes))
-            # container_doc 作为最终容器（保留原始页脚/节属性）
             container_doc = Document(io.BytesIO(content_bytes))
             
-            # 获取替换规则
             if "==>>" in user_input:
                 replacements = parse_rules(user_input)
             else:
                 if not api_key:
-                    st.error("请在上方设置中输入 API Key")
+                    st.error("请输入 API Key")
                     return
-                # 样本提取（包含标题部分）
                 sample_text = "\n".join([p.text for p in source_doc.paragraphs[:20]])
                 ai_raw = get_deepseek_rules(api_key, base_url, sample_text, user_input)
                 replacements = parse_rules(ai_raw)
@@ -146,27 +160,22 @@ def main():
                 st.error("未能识别修改指令。")
                 return
 
-            # --- 核心替换流程 ---
-            # 第一步：修改源文档内容
+            # 对源文档执行替换（强化算法）
             safe_replace_text(source_doc, replacements)
-            
-            # 第二步：将源文档改好的正文（段落和表格）克隆到容器中
-            # 注意：此步不触碰容器原有的页眉页脚（sectPr）
+            # 克隆正文
             clone_only_body_content(source_doc, container_doc)
-
-            # 第三步：【关键修复】对容器文档本身再次执行替换
-            # 因为页眉标题存在于容器的节属性中，必须对容器也跑一遍替换逻辑
+            # 对容器（页眉标题）执行再次替换
             safe_replace_text(container_doc, replacements)
 
             output = io.BytesIO()
             container_doc.save(output)
             output.seek(0)
             
-            st.success(f"✅ 处理成功！已同步替换标题和正文中的 {len(replacements)} 类信息。")
+            st.success(f"✅ 处理完成！已强制同步标题和正文中的 {len(replacements)} 类信息。")
             st.download_button(
-                "📥 点击下载新文档", 
+                "📥 下载结果文件", 
                 data=output, 
-                file_name=f"已修改_{uploaded_file.name}",
+                file_name=f"Fixed_{uploaded_file.name}",
                 use_container_width=True
             )
 
